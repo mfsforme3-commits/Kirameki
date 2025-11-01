@@ -418,14 +418,16 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
     if (canAttemptNative) {
       var uri = Uri.tryParse(directUrl);
       if (uri != null) {
-        final baseHeaders = _headersForUri(uri);
-        final probe = await _probeDirectStream(
-          uri,
-          headers: baseHeaders,
-        );
-        if (probe.isOk) {
-          await _startNativePlayback(uri, baseHeaders);
-          return;
+        final candidates = _headerCandidatesFor(directUrl);
+        for (final headers in candidates) {
+          final ok = await _probeDirectStream(
+            uri,
+            headers: headers,
+          );
+          if (ok) {
+            await _startNativePlayback(uri, headers);
+            return;
+          }
         }
 
         if (_shouldAttemptAlternate(probe.statusCode)) {
@@ -1071,18 +1073,74 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
     return '$minutes:$seconds';
   }
 
-  Map<String, String> _headersForUri(
-    Uri uri, {
-    String? refererOverride,
-  }) {
-    final referer = refererOverride ?? _inferReferer(uri) ?? 'https://hianime.to/';
-    final origin = _originFrom(referer);
+  List<Map<String, String>> _headerCandidatesFor(String url) {
+    final uniqueReferers = <String>{};
+    final candidates = <Map<String, String>>[];
+
+    void addReferer(String? referer) {
+      final normalized = _normalizeReferer(referer);
+      if (normalized == null) return;
+      if (!uniqueReferers.add(normalized)) return;
+      final origin = Uri.parse(normalized).origin;
+      candidates.add(_buildHeaders(origin, normalized));
+    }
+
+    final fallbackSources = _fallbackSources;
+    final preferredFallbacks = <String>[];
+    final secondaryFallbacks = <String>[];
+
+    for (final source in fallbackSources) {
+      final label = source.label.toLowerCase();
+      if (label.contains('vidwish')) {
+        preferredFallbacks.add(source.url);
+      } else {
+        secondaryFallbacks.add(source.url);
+      }
+    }
+
+    for (final referer in preferredFallbacks) {
+      addReferer(referer);
+    }
+    for (final referer in secondaryFallbacks) {
+      addReferer(referer);
+    }
+
+    addReferer(widget.stream.webFallbackUrl);
+
+    final directUri = Uri.tryParse(url);
+    if (directUri != null && directUri.hasScheme && directUri.host.isNotEmpty) {
+      addReferer(directUri.origin);
+    }
+
+    addReferer('https://hianime.to/');
+
+    return candidates;
+  }
+
+  String? _normalizeReferer(String? raw) {
+    if (raw == null) return null;
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return null;
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null || !uri.hasScheme || !uri.hasAuthority) return null;
+    final hasQuery = uri.hasQuery;
+    final base = uri.toString();
+    if (hasQuery || base.endsWith('/')) {
+      return base;
+    }
+    return '$base/';
+  }
+
+  Map<String, String> _buildHeaders(String origin, String referer) {
+    final normalizedOrigin = origin.endsWith('/')
+        ? origin.substring(0, origin.length - 1)
+        : origin;
     return {
       'Referer': referer,
-      'Origin': origin,
-      'User-Agent':
-          'Mozilla/5.0 (Linux; Android 13; Kirameki) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-      'Accept': '*/*',
+      'Origin': normalizedOrigin,
+      'User-Agent': _fallbackUserAgent,
+      'Accept':
+          'application/vnd.apple.mpegurl,application/x-mpegurl;q=0.9,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
       'Connection': 'keep-alive',
     };
