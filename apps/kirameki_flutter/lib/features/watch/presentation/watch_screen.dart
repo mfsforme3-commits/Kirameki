@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -349,9 +350,14 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
   Uri? _currentFallbackUri;
   int _webViewCrashCount = 0;
   bool _consoleSilenced = false;
+  _AlternateStreamSource? _alternateStream;
 
   static const String _fallbackUserAgent =
       'Mozilla/5.0 (Linux; Android 13; KiramekiApp) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+  static const List<_FallbackEndpoint> _fallbackEndpoints = [
+    _FallbackEndpoint(host: 'megaplay.buzz'),
+    _FallbackEndpoint(host: 'vidwish.live'),
+  ];
   static const String _silenceConsoleScript = '''
     (function() {
       if (!window || !window.console) return;
@@ -401,6 +407,7 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
   void _resetPlayback() {
     _disposeController();
     _teardownWebFallback();
+    _alternateStream = null;
   }
 
   Future<void> _initializePlayback() async {
@@ -409,7 +416,7 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
     final canAttemptNative = stream.hasDirectStream && directUrl.isNotEmpty;
 
     if (canAttemptNative) {
-      final uri = Uri.tryParse(directUrl);
+      var uri = Uri.tryParse(directUrl);
       if (uri != null) {
         final candidates = _headerCandidatesFor(directUrl);
         for (final headers in candidates) {
@@ -420,6 +427,23 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
           if (ok) {
             await _startNativePlayback(uri, headers);
             return;
+          }
+        }
+
+        if (_shouldAttemptAlternate(probe.statusCode)) {
+          final alternate = await _resolveAlternateStream(uri);
+          if (alternate != null) {
+            uri = alternate.uri;
+            final altHeaders = _headersForUri(uri, refererOverride: alternate.referer);
+            final altProbe = await _probeDirectStream(
+              uri,
+              headers: altHeaders,
+            );
+            if (altProbe.isOk) {
+              _alternateStream = alternate;
+              await _startNativePlayback(uri, altHeaders);
+              return;
+            }
           }
         }
       }
@@ -435,7 +459,7 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
     }
   }
 
-  Future<bool> _probeDirectStream(
+  Future<_ProbeResult> _probeDirectStream(
     Uri uri, {
     Map<String, String>? headers,
   }) async {
@@ -449,10 +473,73 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
             },
           )
           .timeout(const Duration(seconds: 6));
-      return response.statusCode == 200 || response.statusCode == 206;
+      final ok = response.statusCode == 200 || response.statusCode == 206;
+      return _ProbeResult(isOk: ok, statusCode: response.statusCode);
     } catch (_) {
-      return false;
+      return const _ProbeResult(isOk: false);
     }
+  }
+
+  bool _shouldAttemptAlternate(int? statusCode) {
+    if (statusCode == null) return true;
+    return statusCode == 401 || statusCode == 403;
+  }
+
+  Future<_AlternateStreamSource?> _resolveAlternateStream(Uri uri) async {
+    final cached = _alternateStream;
+    if (cached != null) {
+      return cached;
+    }
+
+    final sourceId = _extractSourceId(uri);
+    if (sourceId == null) {
+      return null;
+    }
+
+    for (final endpoint in _fallbackEndpoints) {
+      try {
+        final response = await http
+            .get(
+              endpoint.buildUri(sourceId),
+              headers: endpoint.headers,
+            )
+            .timeout(const Duration(seconds: 6));
+        if (response.statusCode != 200) {
+          continue;
+        }
+        final payload = jsonDecode(response.body);
+        if (payload is! Map<String, dynamic>) {
+          continue;
+        }
+        final sources = payload['sources'];
+        final file = sources is Map<String, dynamic>
+            ? sources['file'] as String?
+            : null;
+        if (file == null || file.isEmpty) {
+          continue;
+        }
+        final resolvedUri = Uri.tryParse(file.trim());
+        if (resolvedUri == null) {
+          continue;
+        }
+        return _AlternateStreamSource(
+          uri: resolvedUri,
+          referer: endpoint.referer,
+        );
+      } catch (_) {
+        // Ignore resolution errors and try the next endpoint.
+      }
+    }
+
+    return null;
+  }
+
+  String? _extractSourceId(Uri uri) {
+    final segments = uri.pathSegments;
+    if (segments.length < 2) {
+      return null;
+    }
+    return segments[segments.length - 2];
   }
 
   Future<void> _startNativePlayback(
@@ -1058,6 +1145,71 @@ class _VideoPlayerPaneState extends State<_VideoPlayerPane> {
       'Connection': 'keep-alive',
     };
   }
+
+  String? _inferReferer(Uri? uri) {
+    if (uri == null) return null;
+    final host = uri.host;
+    if (host.contains('dotstream') || host.contains('megaplay')) {
+      return 'https://megaplay.buzz/';
+    }
+    if (host.contains('vidwish') || host.contains('vizcloud') || host.contains('wishfast')) {
+      return 'https://vidwish.live/';
+    }
+    if (host.contains('watching.onl') && _alternateStream != null) {
+      return _alternateStream!.referer;
+    }
+    return null;
+  }
+
+  String _originFrom(String referer) {
+    try {
+      final uri = Uri.parse(referer);
+      final buffer = StringBuffer()
+        ..write(uri.scheme)
+        ..write('://')
+        ..write(uri.host);
+      if (uri.hasPort && uri.port != 80 && uri.port != 443) {
+        buffer
+          ..write(':')
+          ..write(uri.port);
+      }
+      return buffer.toString();
+    } catch (_) {
+      return 'https://hianime.to';
+    }
+  }
+}
+
+class _AlternateStreamSource {
+  const _AlternateStreamSource({required this.uri, required this.referer});
+
+  final Uri uri;
+  final String referer;
+}
+
+class _FallbackEndpoint {
+  const _FallbackEndpoint({required this.host});
+
+  final String host;
+
+  Uri buildUri(String id) => Uri.https(host, '/stream/getSources', {'id': id});
+
+  String get referer => 'https://$host/';
+
+  Map<String, String> get headers => {
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': referer,
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent':
+            'Mozilla/5.0 (Linux; Android 13; Kirameki) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+      };
+}
+
+class _ProbeResult {
+  const _ProbeResult({required this.isOk, this.statusCode});
+
+  final bool isOk;
+  final int? statusCode;
 }
 
 class _PlaybackControls extends StatelessWidget {
